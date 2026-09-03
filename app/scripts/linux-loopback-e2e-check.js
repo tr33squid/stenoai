@@ -20,6 +20,48 @@ const { measurePeakRms } = require('../../scripts/measure-pcm');
 
 const APP_DIR = path.resolve(__dirname, '..');
 
+async function waitFor(predicate, what, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`);
+}
+
+// A distro without the ALSA sample would otherwise play silence and the check
+// would blame the bridge. Synthesise a tone instead of depending on a fixture
+// that only some installs ship.
+function resolveTone(dir) {
+  const alsaSample = '/usr/share/sounds/alsa/Front_Center.wav';
+  if (fs.existsSync(alsaSample)) return alsaSample;
+  const out = path.join(dir, 'tone.wav');
+  const rate = 48000;
+  const seconds = 1;
+  const frames = rate * seconds;
+  const data = Buffer.alloc(frames * 2);
+  for (let i = 0; i < frames; i++) {
+    // 440 Hz at roughly half scale — loud enough to clear any noise floor.
+    data.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / rate) * 16000), i * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write('WAVEfmt ', 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);            // PCM
+  header.writeUInt16LE(1, 22);            // mono
+  header.writeUInt32LE(rate, 24);
+  header.writeUInt32LE(rate * 2, 28);     // byte rate
+  header.writeUInt16LE(2, 32);            // block align
+  header.writeUInt16LE(16, 34);           // bits per sample
+  header.write('data', 36);
+  header.writeUInt32LE(data.length, 40);
+  fs.writeFileSync(out, Buffer.concat([header, data]));
+  console.log(`ALSA sample missing; synthesised a 440 Hz tone at ${out}`);
+  return out;
+}
+
 async function main() {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stenoai-linux-loopback-check-'));
   // Mirrors e2e/fixtures/user-config.ts's enableDeterministicRecording: whisper
@@ -32,6 +74,7 @@ async function main() {
   );
 
   console.log('userDataDir:', userDataDir);
+  const tonePath = resolveTone(userDataDir);
 
   const app = await electron.launch({
     args: [
@@ -64,36 +107,53 @@ async function main() {
     console.log('start():', started);
     if (!started.success) throw new Error('recording start failed: ' + started.error);
 
-    // Give the capture graph a moment to spin up (mic + Linux loopback IPC
-    // start + AudioContext wiring) before we start playing audio.
-    await new Promise((r) => setTimeout(r, 1000));
+    // Wait for capture to be genuinely live rather than guessing with a fixed
+    // delay. The renderer opens the on-disk file only after the loopback stream
+    // is acquired and the audio graph is wired, so the file appearing is a real
+    // signal — and needs no test-only hook in production code.
+    const recordingsDir = path.join(userDataDir, 'recordings');
+    await waitFor(
+      () => fs.existsSync(recordingsDir)
+        && fs.readdirSync(recordingsDir).some((f) => f.startsWith('sysaudio-')),
+      'capture to start',
+    );
 
-    console.log('playing test audio into the default sink...');
-    const playProc = spawn('pw-play', ['--volume=1.0', '/usr/share/sounds/alsa/Front_Center.wav']);
-    // Loop the short clip a few times to fill the recording window with signal.
-    for (let i = 0; i < 4; i++) {
+    console.log(`playing test audio into the default sink (${tonePath})...`);
+    const players = [];
+    for (let i = 0; i < 5; i++) {
+      players.push(spawn('pw-play', ['--volume=1.0', tonePath]));
       await new Promise((r) => setTimeout(r, 900));
-      spawn('pw-play', ['--volume=1.0', '/usr/share/sounds/alsa/Front_Center.wav']);
     }
     await new Promise((r) => setTimeout(r, 600));
-    try { playProc.kill(); } catch { /* likely already exited */ }
+    for (const p of players) { try { p.kill(); } catch { /* already exited */ } }
 
     const stopped = await page.evaluate(() => window.stenoai.recording.stop());
     console.log('stop():', stopped);
     if (!stopped.success) throw new Error('recording stop failed: ' + stopped.error);
 
-    // Give the renderer's onstop -> appendChain -> closeSystemAudioFile
-    // handoff a moment to finish flushing the last chunks to disk.
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const recordingsDir = path.join(userDataDir, 'recordings');
-    const files = fs.existsSync(recordingsDir)
-      ? fs.readdirSync(recordingsDir).filter((f) => f.startsWith('sysaudio-'))
-      : [];
-    console.log('recordings dir contents:', files);
-    if (files.length === 0) throw new Error('no sysaudio-*.webm file found');
-    const webmPath = path.join(recordingsDir, files[0]);
-    console.log('recording file:', webmPath, fs.statSync(webmPath).size, 'bytes');
+    // Poll for a file whose size has stopped changing rather than guessing:
+    // scanning mid-flush yields either "no file" or a truncated WebM, both of
+    // which read as a broken bridge. Needs several consecutive unchanged reads
+    // — MediaRecorder writes a timeslice per second, so two 250ms samples can
+    // both land in the gap between chunks and call a growing file finished
+    // (which shows up as ffmpeg's "File ended prematurely" and mismatched
+    // per-channel sample counts).
+    const STABLE_READS = 6;
+    let webmPath = null;
+    let lastSize = -1;
+    let stableReads = 0;
+    await waitFor(async () => {
+      const files = fs.existsSync(recordingsDir)
+        ? fs.readdirSync(recordingsDir).filter((f) => f.startsWith('sysaudio-'))
+        : [];
+      if (files.length === 0) return false;
+      webmPath = path.join(recordingsDir, files[0]);
+      const size = fs.statSync(webmPath).size;
+      stableReads = size > 0 && size === lastSize ? stableReads + 1 : 0;
+      lastSize = size;
+      return stableReads >= STABLE_READS;
+    }, 'the recording to finish flushing');
+    console.log('recording file:', webmPath, lastSize, 'bytes');
 
     // Split L (mic, faked/silent) and R (system, real pw-record capture)
     // channels to raw PCM and measure each independently.
